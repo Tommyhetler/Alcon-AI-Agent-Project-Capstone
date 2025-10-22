@@ -1,0 +1,442 @@
+import os
+import ast
+import io
+import json
+import base64
+import urllib.request
+from typing import List, Tuple, Optional
+
+import gradio as gr
+from dotenv import load_dotenv
+from openai import OpenAI
+from PIL import Image
+
+# --- env & client ---
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is not set in your environment.")
+
+# MODEL CONFIG
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")          # chat
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")   # image
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")  # embeddings for Chroma
+
+client = OpenAI(api_key=api_key)
+
+# --- sqlite shim for chroma in some environments ---
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+import chromadb
+from chromadb.utils import embedding_functions
+
+facts = "facts.txt"
+
+# ----------------------
+# Facts loader: accepts JSON list, Python list literal, or newline text
+# ----------------------
+def load_facts(file_path: str) -> List[str]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+
+    # Try JSON first
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list) and all(isinstance(x, str) for x in data):
+            return [s.strip() for s in data if s.strip()]
+    except Exception:
+        pass
+
+    # Try Python list literal
+    try:
+        data = ast.literal_eval(raw)
+        if isinstance(data, list) and all(isinstance(x, str) for x in data):
+            return [s.strip() for s in data if s.strip()]
+    except Exception:
+        pass
+
+    # Fallback: one fact per line
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    return lines
+
+# ----------------------
+# RAG: load facts to Chroma (with OpenAI embeddings so .query works)
+# ----------------------
+def embed_facts(file_path: str):
+    documents = load_facts(file_path)
+
+    ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=api_key,
+        model_name=OPENAI_EMBED_MODEL
+    )
+
+    chroma_client = chromadb.Client()
+    collection = chroma_client.get_or_create_collection(
+        name="my_collection",
+        embedding_function=ef
+    )
+
+    if documents:
+        ids = [f"fact-{i}" for i in range(len(documents))]
+        collection.upsert(documents=documents, ids=ids)
+    return collection
+
+collection = embed_facts(facts)
+
+# ----------------------
+# Base system guidance (brand + soft compliance)
+# ----------------------
+COMPLIANCE_RULES = (
+    "Compliance rules:\n"
+    "• No medical claims, safety/efficacy assertions, or guarantees.\n"
+    "• Avoid comparative/superlative claims (e.g., “best,” “safest,” “#1,” “better than X”).\n"
+    "• Use clear, balanced language; encourage consulting an eye care professional.\n"
+    "• Respect brand tone: clear, positive, caring; avoid jargon.\n"
+)
+
+BRAND_CONTEXT = (
+    "Products: Alcon’s Clareon Toric IOL, Clareon PanOptix IOL, Precision1 Contact Lenses, TOTAL30 Contact Lenses. "
+    "Audience: eye-care professionals and prospective wearers. Voice: concise, friendly, compliant."
+)
+
+def build_system_prompt(rag_snippet: Optional[str]) -> str:
+    base = (
+        "You are an expert in Alcon marketing and produce concrete, compliant, creative campaign assets.\n"
+        f"{BRAND_CONTEXT}\n"
+        f"{COMPLIANCE_RULES}\n"
+        "Avoid vague advice. Be concise. If clinical or comparative claims are requested, "
+        "explain you cannot make those claims and suggest compliant alternatives.\n"
+    )
+    if rag_snippet:
+        base += f"\nRelevant context:\n{rag_snippet}\n"
+    return base
+
+# ----------------------
+# RAG helper
+# ----------------------
+def safe_query_context(question: str) -> str:
+    try:
+        res = collection.query(query_texts=[question], n_results=1)
+        return res.get("documents", [[]])[0][0] if res.get("documents") and res["documents"][0] else ""
+    except Exception:
+        return ""
+
+# ----------------------
+# Chat completion (CONVERSATIONAL: uses history)
+# ----------------------
+def chatgpt_response(question: str, history: List[Tuple[str, str]]) -> str:
+    rag = safe_query_context(question)
+    system_content = build_system_prompt(rag)
+
+    MAX_TURNS = 6
+    recent_history = history[-MAX_TURNS:] if history else []
+
+    messages = [{"role": "system", "content": system_content}]
+    for u, a in recent_history:
+        if u:
+            messages.append({"role": "user", "content": u})
+        if a:
+            messages.append({"role": "assistant", "content": a})
+    messages.append({"role": "user", "content": question})
+
+    # Simple retry
+    for attempt in range(3):
+        try:
+            chat_completion = client.chat.completions.create(
+                model=OPENAI_CHAT_MODEL,
+                messages=messages,
+                temperature=0.2,
+                top_p=0.6,
+                max_tokens=900
+            )
+            return chat_completion.choices[0].message.content
+        except Exception as e:
+            if attempt == 2:
+                raise gr.Error(f"Chat request failed: {e}")
+
+# ----------------------
+# Compliance Check (post-generation) + inline highlighting
+# ----------------------
+RISKY_TERMS = {
+    "superlatives": [r"\b(best|safest|#1|leading|unmatched|unsurpassed)\b"],
+    "guarantees": [r"\b(guarantee(d)?|promise|risk[-\s]?free|zero risk|pain[-\s]?free)\b"],
+    "medical_claims": [r"\b(treats?|cures?|heals?|eliminates?)\b",
+                       r"\b(100%|always|will|permanent|instant(ly)?)\b"],
+}
+REQUIRED_DISCLOSURE = "Talk to an eye care professional to see if these lenses are right for you."
+
+def highlight_spans(text: str, spans: List[Tuple[int, int]]) -> str:
+    """Return text with <mark>…</mark> wrapped around risky spans."""
+    if not spans:
+        return text
+    # Sort by start desc to avoid index shifts while inserting tags
+    spans_sorted = sorted(spans, key=lambda s: s[0], reverse=True)
+    out = text
+    for start, end in spans_sorted:
+        out = out[:start] + "<mark>" + out[start:end] + "</mark>" + out[end:]
+    return out
+
+def run_compliance_check(text: str, facts_snippet: str = ""):
+    import re
+    issues = []
+    spans = []
+    for rule, patterns in RISKY_TERMS.items():
+        for pat in patterns:
+            for m in re.finditer(pat, text, flags=re.I):
+                issues.append({
+                    "rule": rule,
+                    "span": (m.start(), m.end()),
+                    "excerpt": text[m.start():m.end()],
+                    "severity": "high" if rule in ("medical_claims", "guarantees") else "medium"
+                })
+                spans.append((m.start(), m.end()))
+
+    missing_disclosure = REQUIRED_DISCLOSURE.lower() not in text.lower()
+    annotated_text = highlight_spans(text, spans)
+
+    compliant_text = text
+    if issues or missing_disclosure:
+        sys_prompt = (
+            "You are a compliance editor for regulated medical marketing. "
+            "Remove clinical/superlative/guarantee claims and add balanced guidance. "
+            "Keep brand voice and concision. Do not invent approvals or data. "
+            f"Facts (may use tone cues, not for clinical claims): {facts_snippet}"
+        )
+        user_prompt = (
+            "Rewrite the following copy to be compliant. "
+            "Avoid superlatives, guarantees, and medical claims. "
+            "Add a brief consult-a-professional line if missing.\n\n"
+            f"Original:\n{text}\n\n"
+            f"Ensure inclusion of: {REQUIRED_DISCLOSURE}"
+        )
+        try:
+            edited = client.chat.completions.create(
+                model=OPENAI_CHAT_MODEL,
+                messages=[{"role":"system","content":sys_prompt},
+                          {"role":"user","content":user_prompt}],
+                temperature=0.2,
+                max_tokens=500
+            ).choices[0].message.content
+            compliant_text = edited.strip()
+        except Exception:
+            if missing_disclosure:
+                compliant_text = text.rstrip() + " " + REQUIRED_DISCLOSURE
+
+    return {
+        "issues": issues,
+        "missing_disclosure": missing_disclosure,
+        "annotated_text": annotated_text,
+        "compliant_text": compliant_text
+    }
+
+# ----------------------
+# Image generation (hardened)
+# ----------------------
+def generate_image(prompt: str, size: str = "1024x1024"):
+    if not prompt or not prompt.strip():
+        raise gr.Error("Please enter an image description.")
+
+    try:
+        result = client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt.strip(),
+            size=size,
+            response_format="b64_json"  # ensure base64 response
+        )
+
+        # Prefer base64 if provided
+        if result.data and getattr(result.data[0], "b64_json", None):
+            b64 = result.data[0].b64_json
+            img_bytes = base64.b64decode(b64)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            return img
+
+        # Fallback: if a URL is returned
+        if result.data and getattr(result.data[0], "url", None):
+            with urllib.request.urlopen(result.data[0].url, timeout=30) as r:
+                content = r.read()
+            img = Image.open(io.BytesIO(content)).convert("RGB")
+            return img
+
+        # If neither b64 nor URL is present
+        raise gr.Error("Image API returned no image data. Check model access and prompt content.")
+
+    except Exception as e:
+        raise gr.Error(f"Image generation failed: {e}")
+
+# ----------------------
+# UI (VisionNova / Alcon hero layout)
+# ----------------------
+def respond(message, chat_history, compliance_checked):
+    reply = chatgpt_response(message, chat_history or [])
+
+    if compliance_checked:
+        ctx = safe_query_context(message)  # optional facts to guide rewrite tone
+        check = run_compliance_check(reply, ctx)
+        if check["issues"] or check["missing_disclosure"]:
+            issue_summ = ", ".join(sorted(set(i["rule"] for i in check["issues"]))) if check["issues"] else "none"
+            notes = f"Compliance notes: issues={len(check['issues'])} (types: {issue_summ})"
+            if check["missing_disclosure"]:
+                notes += " + missing disclosure"
+            # Show highlighted original, then compliant rewrite
+            reply = (
+                f"{check['annotated_text']}\n\n---\n{notes}\n\n"
+                f"Compliant rewrite:\n{check['compliant_text']}"
+            )
+
+    chat_history = (chat_history or [])
+    chat_history.append((message, reply))
+    return "", chat_history
+
+# ----- THEME / CSS -----
+custom_css = """
+:root { --alcon-blue:#003595; --vision-purple:#4E0F78; }
+
+body, .gradio-container {
+  background: radial-gradient(circle at 50% 35%, #f6f9ff 0%, #eef3ff 45%, #ffffff 85%) !important;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji" !important;
+  color: var(--alcon-blue) !important;
+}
+
+/* HERO */
+#hero-wrapper {
+  position: sticky; top: 0; z-index: 50;
+  backdrop-filter: blur(8px);
+  background: linear-gradient(180deg, rgba(255,255,255,0.9) 0%, rgba(255,255,255,0.6) 100%);
+  padding-top: 10px; padding-bottom: 8px;
+}
+#hero { text-align:center; margin: 10px auto 6px auto; }
+#hero h1 { margin: 8px 0 6px 0; font-weight: 700; letter-spacing:.3px; color: var(--alcon-blue); }
+#hero p { margin: 0; color: var(--vision-purple); opacity:.95; }
+
+/* Search bar row */
+#hero-row { max-width: 900px; margin: 10px auto 6px auto; }
+#hero-input .gr-text-input {
+  font-size: 1.05rem; padding: 16px 18px; height: 56px;
+  border-radius: 18px !important; border: 1px solid #d9e3f5 !important;
+  box-shadow: 0 6px 24px rgba(0,53,149,0.06);
+  background: rgba(255,255,255,0.9);
+}
+#hero-go button {
+  height: 56px; width: 64px; border-radius: 16px !important;
+  background-color: var(--alcon-blue) !important; color: #fff !important; font-size: 20px; font-weight: 700;
+  box-shadow: 0 6px 18px rgba(0,53,149,0.18);
+}
+#cc-mini { max-width: 900px; margin: 2px auto 8px auto; }
+#cc-mini label { color:#334e96; }
+
+/* Chat card */
+#chatbot {
+  background: rgba(255,255,255,0.85);
+  border: 1px solid #d9e3f5; border-radius: 20px;
+  box-shadow: 0 8px 24px rgba(0,53,149,0.07);
+}
+
+/* Tabs */
+.tabs > button {
+  color: var(--alcon-blue) !important; font-weight: 600 !important;
+}
+
+/* Footer links */
+#links { text-align:center; color:#6b7bb8; margin: 8px 0 30px 0; }
+#links a { color:#6b7bb8; text-decoration:none; }
+#links a:hover { color: var(--alcon-blue); text-decoration: underline; }
+
+/* Make <mark> look brand-aligned */
+mark {
+  background: #fff2a8;
+  color: inherit;
+  padding: 0 .15em;
+  border-radius: .25em;
+}
+"""
+
+with gr.Blocks(theme="soft", css=custom_css) as interface:
+    # --- HERO (sticky wrapper) ---
+    gr.HTML(
+        """
+        <div id="hero-wrapper">
+          <div id="hero">
+              <img src="https://upload.wikimedia.org/wikipedia/commons/f/fb/Alcon_logo.svg" alt="Alcon" width="140" />
+              <h1>Bring your vision to life</h1>
+              <p>Generate compliant, creative campaign ideas & visuals.</p>
+          </div>
+          <div id="links">
+              <a href="#">About</a> &nbsp;·&nbsp;
+              <a href="#">How it Works</a> &nbsp;·&nbsp;
+              <a href="#">Contact</a>
+          </div>
+          <div>
+        </div>
+        """,
+    )
+
+    # --- HERO INPUT ROW (Search-style) ---
+    with gr.Row(elem_id="hero-row"):
+        hero_prompt = gr.Textbox(
+            show_label=False,
+            placeholder="Intended for those who see beyond",
+            lines=1,
+            elem_id="hero-input"
+        )
+        hero_go = gr.Button("✦", elem_id="hero-go")
+
+    # Compliance toggle (small, under the bar)
+    cc_toggle = gr.Checkbox(label="Compliance check", value=True, elem_id="cc-mini")
+
+    # --- MAIN CONTENT: Chat + Image Generator ---
+    with gr.Tabs():
+        with gr.Tab("Chat"):
+            # Enable markdown so <mark> shows; Chatbot renders markdown by default
+            chatbot = gr.Chatbot(height=520, elem_id="chatbot")
+
+            # Secondary controls (for follow-up turns)
+            with gr.Row():
+                followup = gr.Textbox(
+                    label="Your Marketing Prompt",
+                    placeholder="Ask follow-up: e.g., 3 Instagram captions for TOTAL30 newcomers",
+                    lines=2
+                )
+                send = gr.Button("Send")
+                clear = gr.Button("Clear")
+
+            # Wire BOTH inputs to respond()
+            hero_prompt.submit(respond, [hero_prompt, chatbot, cc_toggle], [hero_prompt, chatbot])
+            hero_go.click(respond, [hero_prompt, chatbot, cc_toggle], [hero_prompt, chatbot])
+
+            followup.submit(respond, [followup, chatbot, cc_toggle], [followup, chatbot])
+            send.click(respond, [followup, chatbot, cc_toggle], [followup, chatbot])
+            clear.click(lambda: ("", []), None, [followup, chatbot], queue=False)
+
+        with gr.Tab("Image Generator"):
+            ig_prompt = gr.Textbox(
+                label="Describe the image to generate",
+                placeholder="Clean, clinical product hero of TOTAL30 contact lens box on white background with soft shadows",
+                lines=3
+            )
+            ig_size = gr.Dropdown(
+                label="Image Size",
+                choices=["512x512", "768x768", "1024x1024"],
+                value="1024x1024"
+            )
+            ig_button = gr.Button("Generate Image")
+            ig_out = gr.Image(label="Generated Image", interactive=False)
+            ig_err = gr.Markdown(visible=False)
+
+            def wrapped_generate(prompt, size):
+                try:
+                    img = generate_image(prompt, size)
+                    return img, gr.update(visible=False, value="")
+                except gr.Error as e:
+                    return None, gr.update(visible=True, value=f"**Error:** {e}")
+
+            ig_button.click(wrapped_generate, [ig_prompt, ig_size], [ig_out, ig_err])
+
+# --- launch ---
+if __name__ == "__main__":
+    # For Codespaces you can uncomment:
+    # port = int(os.environ.get("PORT", "7860"))
+    # interface.launch(server_name="0.0.0.0", server_port=port, inbrowser=False, share=False)
+    interface.launch()
