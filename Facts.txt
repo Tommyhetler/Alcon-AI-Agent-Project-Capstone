@@ -1,0 +1,18 @@
+[
+    "Alcon’s purpose is to help people see brilliantly.",
+    "Alcon’s brand voice should be clear, positive, and caring, avoiding jargon.",
+    "Always use the official Alcon logo; don’t change its color, shape, or add effects.",
+    "Keep clear space around the Alcon logo so it is easy to see.",
+    "Main brand color is Alcon Blue (#003595). Other key colors: Cyan (#00AEEF), Dark Teal (#007483), Purple (#4E0F78), Green (#00AE44), Orange (#FF6B12), Red (#9B1A2F).",
+    "Preferred font is Open Sans; Arial can be used if needed.",
+    "Photography style should be bright, clear, and natural—not dark, fake, or overly edited.",
+    "Show real, diverse people in authentic moments; avoid stiff poses.",
+    "Focus on healthy, vibrant eyes; avoid glasses unless it’s an employee at work.",
+    "Use clean, uncluttered backgrounds so text and logos stand out.",
+    "Maintain consistent style across all media: social, slides, emails, posters.",
+    "Do not create your own logos or random designs.",
+    "Do not add ™ or ® to the Alcon name or logo.",
+    "Use product names correctly (e.g., PRECISION1® contact lenses, not 'Precision lenses').",
+    "Do not invent names or taglines.",
+    "Keep text clear and simple: short sentences, plain language, no jargon."
+]
